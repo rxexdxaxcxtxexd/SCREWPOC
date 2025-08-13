@@ -59,9 +59,9 @@ class SkipReason(Enum):
 @dataclass
 class ExtractConfig:
     max_inch: float = 300.0
-    prefer_inches_in_parentheses: bool = False  # Changed per requirement
+    prefer_inches_in_parentheses: bool = True  # Enable parentheses preference
     rl_default_bar_feet: float = 12.0
-    ft_tolerance_pct: float = 0.10  # 10% tolerance
+    ft_tolerance_pct: float = 0.05  # 5% tolerance (tightened from 10%)
     round_length_ndp: int = 2       # round to 2 decimals
     use_round_for_ft_qty: bool = True
     enable_diagnostics: bool = True
@@ -78,8 +78,8 @@ class ExtractConfig:
 # Enhanced regex patterns (more flexible)
 # ---------------------------
 
-# Item code patterns
-RE_CODE_SUFFIX_NUM = re.compile(r"-(\d+)$")
+# Item code patterns - Updated to support decimals
+RE_CODE_SUFFIX_NUM = re.compile(r"-(\d+(?:\.\d+)?)$")
 RE_CODE_SUFFIX_L = re.compile(r"-L$", re.IGNORECASE)
 
 # Parentheses patterns (for reference but lower priority)
@@ -103,16 +103,25 @@ RE_MM_ONLY = re.compile(
 # X-by pattern
 RE_X_BY = re.compile(r"\b(?:x|×|by)\b", re.IGNORECASE)
 
-# Enhanced cut plan patterns - much more flexible
+# Enhanced cut plan patterns - much more flexible with multi-segment support
 CUT_PATTERNS = [
-    # Standard patterns with various formats
-    re.compile(r"(?:\*+)?\s*CUT\s+(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?)\s*(?:TO|@)\s*(?P<len>[\d\s\-/\"'\.]+?)(?:\s*(?:OAL|OVERALL|LENGTH|EACH|EA\.?))?\s*(?:\*+)?", re.IGNORECASE),
-    # Reversed order: "CUT TO X" THEN "Y PCS"
-    re.compile(r"(?:\*+)?\s*CUT\s+TO\s+(?P<len>[\d\s\-/\"'\.]+?)\s*(?:OAL)?\s*(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?)", re.IGNORECASE),
-    # Simple "X PCS TO Y" or "X PCS @ Y"
-    re.compile(r"(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?|PC\.?)\s*(?:TO|@)\s*(?P<len>[\d\s\-/\"'\.]+?)(?:\s*(?:OAL|LENGTH|LENGTHS|EACH)?)", re.IGNORECASE),
+    # Standard patterns with various formats - Enhanced for "OAL each"
+    re.compile(r"(?:\*+)?\s*CUT\s+(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?)\s*(?:TO|@)\s*(?P<len>[\d\s\-/\"'\.]+?)(?:\s*(?:OAL|OVERALL|LENGTH)(?:\s+EACH|EA\.?)?|\s*(?:EACH|EA\.?))?\s*(?:\*+)?", re.IGNORECASE),
+    # Reversed order: "CUT TO X" THEN "Y PCS" - Enhanced for "OAL each"  
+    re.compile(r"(?:\*+)?\s*CUT\s+TO\s+(?P<len>[\d\s\-/\"'\.]+?)\s*(?:OAL(?:\s+EACH)?)??\s*(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?)", re.IGNORECASE),
+    # Simple "X PCS TO Y" or "X PCS @ Y" - Enhanced for "OAL each"
+    re.compile(r"(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?|PC\.?)\s*(?:TO|@)\s*(?P<len>[\d\s\-/\"'\.]+?)(?:\s*(?:OAL|LENGTH|LENGTHS)(?:\s+EACH)?|\s*EACH)?", re.IGNORECASE),
     # "X PIECES OF Y LENGTH"
     re.compile(r"(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?)\s*(?:OF|AT)\s*(?P<len>[\d\s\-/\"'\.]+?)\s*(?:LENGTH|LONG)?", re.IGNORECASE),
+]
+
+# Ambiguous cut instruction patterns
+AMBIGUOUS_CUT_PATTERNS = [
+    re.compile(r"CUT\s+(?:BARS?\s+)?IN\s+HALF", re.IGNORECASE),
+    re.compile(r"CUT\s+(?:INTO\s+)?(?:THIRDS?|1/3)", re.IGNORECASE), 
+    re.compile(r"CUT\s+(?:INTO\s+)?(?:QUARTERS?|1/4)", re.IGNORECASE),
+    re.compile(r"CUT\s+(?:BARS?\s+)?AS\s+NEEDED", re.IGNORECASE),
+    re.compile(r"CUT\s+(?:BARS?\s+)?IF\s+NECESSARY", re.IGNORECASE),
 ]
 
 # RL patterns
@@ -249,25 +258,55 @@ def extract_len_from_xby(text: str) -> Optional[float]:
     return parse_len_token_to_inches(tail)
 
 def find_all_cut_plans(text: str, diagnostics: List[str]) -> List[Tuple[int, float]]:
-    """Find all cut instructions in text using flexible patterns"""
+    """Find all cut instructions in text using flexible patterns with multi-segment support"""
     if not text:
         return []
     
     out: List[Tuple[int, float]] = []
     text_upper = text.upper()
     
-    # Try each pattern
-    for pattern_idx, pattern in enumerate(CUT_PATTERNS):
-        for m in pattern.finditer(text):
+    # Split text on common delimiters for multi-segment parsing
+    segments = []
+    # Split on semicolons, "and", "&", or multiple spaces
+    import re as re_module
+    segment_splitter = re_module.compile(r'[;&]|\s+AND\s+|\s+&\s+|\s{3,}', re_module.IGNORECASE)
+    segments = [seg.strip() for seg in segment_splitter.split(text) if seg.strip()]
+    
+    # If no splitting occurred, use original text
+    if len(segments) <= 1:
+        segments = [text]
+    
+    # Process each segment
+    for seg_idx, segment in enumerate(segments):
+        segment_matches = []
+        
+        # Try each pattern on this segment
+        for pattern_idx, pattern in enumerate(CUT_PATTERNS):
+            for m in pattern.finditer(segment):
+                try:
+                    cnt = int(m.group("count"))
+                    len_str = m.group("len")
+                    inches = parse_len_token_to_inches(len_str)
+                    if inches is not None and inches > 0:
+                        segment_matches.append((cnt, inches))
+                        diagnostics.append(f"Cut pattern {pattern_idx+1} matched in segment {seg_idx+1}: {cnt} pcs @ {inches:.2f}\"")
+                except Exception as e:
+                    diagnostics.append(f"Cut pattern {pattern_idx+1} parse error in segment {seg_idx+1}: {e}")
+        
+        # Add segment matches to output
+        out.extend(segment_matches)
+        
+        # Check for drop/leftover pieces mentioned in segment
+        drop_pattern = re_module.compile(r'(?:DROP|LEFTOVER|REMAINDER|SCRAP)\s*(?:PIECE?S?)?\s*(?:OF\s+)?(?P<len>[\d\s\-/\"\'\.]+?)(?:\s|$)', re_module.IGNORECASE)
+        for drop_match in drop_pattern.finditer(segment):
             try:
-                cnt = int(m.group("count"))
-                len_str = m.group("len")
+                len_str = drop_match.group("len")
                 inches = parse_len_token_to_inches(len_str)
                 if inches is not None and inches > 0:
-                    out.append((cnt, inches))
-                    diagnostics.append(f"Cut pattern {pattern_idx+1} matched: {cnt} pcs @ {inches:.2f}\"")
+                    out.append((1, inches))  # Assume 1 piece for drop
+                    diagnostics.append(f"Found drop piece in segment {seg_idx+1}: 1 pc @ {inches:.2f}\"")
             except Exception as e:
-                diagnostics.append(f"Cut pattern {pattern_idx+1} parse error: {e}")
+                diagnostics.append(f"Drop piece parse error in segment {seg_idx+1}: {e}")
     
     # Remove duplicates while preserving order
     seen = set()
@@ -277,7 +316,21 @@ def find_all_cut_plans(text: str, diagnostics: List[str]) -> List[Tuple[int, flo
             seen.add(item)
             unique_out.append(item)
     
+    # Flag if complex multi-cut was processed
+    if len(segments) > 1 and unique_out:
+        diagnostics.append(f"Complex multi-cut instruction processed: {len(segments)} segments, {len(unique_out)} cut groups")
+    
     return unique_out
+
+def detect_ambiguous_cuts(text: str) -> bool:
+    """Detect ambiguous cut instructions like 'cut in half'"""
+    if not text:
+        return False
+    
+    for pattern in AMBIGUOUS_CUT_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
 
 def is_non_screw_item(desc: str) -> bool:
     """Check if item is not a screw based on description"""
@@ -295,24 +348,45 @@ def is_non_screw_item(desc: str) -> bool:
     has_non_screw = any(keyword in desc_upper for keyword in NON_SCREW_KEYWORDS)
     return has_non_screw
 
-def parse_item_code_suffix_inches(code: str) -> Optional[float]:
-    """Extract length from item code suffix (highest priority)"""
+def parse_item_code_suffix_inches(code: str, diagnostics: List[str] = None) -> Optional[float]:
+    """Extract length from item code suffix with enhanced decimal and mm conversion support"""
     if not code:
         return None
+    
+    if diagnostics is None:
+        diagnostics = []
     
     # Skip -L codes
     if RE_CODE_SUFFIX_L.search(code):
         return None
     
-    # Look for numeric suffix
+    # Look for numeric suffix (now supports decimals)
     m = RE_CODE_SUFFIX_NUM.search(code)
     if m:
-        val = _to_float_safe(m.group(1))
+        val_str = m.group(1)
+        val = _to_float_safe(val_str)
+        if val is None:
+            return None
+        
+        # Check if it contains decimal (likely mm)
+        if '.' in val_str:
+            # Decimal values in item codes are typically mm
+            val_inches = val / 25.4
+            diagnostics.append(f"Item code suffix interpreted as mm: {val} -> {val_inches:.2f}\"")
+            return val_inches
         # Check if it could be MM (over 300)
-        if val and val > 300:
+        elif val > 300:
             # Convert MM to inches
-            return val / 25.4
-        return val
+            val_inches = val / 25.4
+            diagnostics.append(f"Item code suffix converted from mm: {val} -> {val_inches:.2f}\"")
+            return val_inches
+        # Check if suspiciously high for inches (but under 300)
+        elif val > 100:
+            # Flag as potentially suspicious but don't convert
+            diagnostics.append(f"Item code suffix unusually high: {val}\" - flagging as suspect")
+            return val
+        else:
+            return val
     
     return None
 
@@ -329,7 +403,7 @@ def stage1_extract_raw(row: pd.Series, cfg: ExtractConfig) -> RawExtraction:
     notes = str(row.get(cfg.col_notes, "") or "")
     
     # 1. Item code suffix (highest priority)
-    code_len = parse_item_code_suffix_inches(code)
+    code_len = parse_item_code_suffix_inches(code, result.diagnostics)
     if code_len:
         result.code_suffix_length = code_len
         result.diagnostics.append(f"Code suffix: {code_len}\"")
@@ -394,27 +468,84 @@ def stage1_extract_raw(row: pd.Series, cfg: ExtractConfig) -> RawExtraction:
 # Stage 2: Apply Business Rules
 # ---------------------------
 
-def stage2_apply_rules(
+def process_rl_item(
+    row: pd.Series,
+    raw: RawExtraction, 
+    cfg: ExtractConfig
+) -> ProcessedResult:
+    """Process Random Length (RL) items with dedicated logic"""
+    result = ProcessedResult()
+    result.diagnostics = raw.diagnostics.copy()
+    
+    orig_qty = row.get(cfg.col_orig_qty, None)
+    orig_uom = str(row.get(cfg.col_orig_uom, "") or "").strip().upper()
+    
+    # Priority 1: Use cut plans if available for RL items
+    if raw.cut_plans:
+        total_pcs = sum(c for c, _ in raw.cut_plans)
+        total_inches = sum(c * l for c, l in raw.cut_plans)
+        
+        if total_pcs > 0:
+            # Weighted average length for RL with cut plans
+            avg_len = total_inches / total_pcs
+            result.official_length = round(avg_len, 2)
+            result.official_qty = total_pcs
+            result.source = "rl_cut_plans"
+            result.confidence = "high"
+            result.rationale = f"RL with {len(raw.cut_plans)} cut group(s), weighted avg"
+            result.diagnostics.append(f"RL cut plan result: {total_pcs} pcs @ {result.official_length}\"")
+            result.flags.append("rl_note_inferred")
+            return result
+    
+    # Priority 2: Use explicit piece count from SHIP X RL pattern
+    if orig_uom in FEETLIKE_UOMS and orig_qty:
+        total_feet = _to_float_safe(orig_qty)
+        
+        if raw.rl_piece_count and raw.rl_piece_count > 0:
+            length_inches = (total_feet * 12.0) / raw.rl_piece_count
+            result.official_length = round(length_inches, 0)  # Round to nearest inch for RL
+            result.official_qty = raw.rl_piece_count
+            result.source = "rl_with_count"
+            result.confidence = "high"
+            result.rationale = f"RL: {total_feet}ft / {raw.rl_piece_count} pcs"
+            result.diagnostics.append(f"RL explicit count: {result.official_qty} pcs @ {result.official_length}\"")
+            return result
+    
+    # Priority 3: Try to infer piece count from cut instructions in notes
+    if raw.cut_plans and orig_uom in FEETLIKE_UOMS and orig_qty:
+        total_feet = _to_float_safe(orig_qty)
+        inferred_pieces = sum(c for c, _ in raw.cut_plans)
+        
+        if inferred_pieces > 0 and total_feet:
+            avg_length = (total_feet * 12.0) / inferred_pieces
+            result.official_length = round(avg_length, 0)  # Round to nearest inch for RL
+            result.official_qty = inferred_pieces
+            result.source = "rl_note_inferred"
+            result.confidence = "medium"
+            result.rationale = f"RL: {total_feet}ft / {inferred_pieces} pcs (inferred from notes)"
+            result.diagnostics.append(f"RL inferred from notes: {result.official_qty} pcs @ {result.official_length}\"")
+            result.flags.append("rl_note_inferred")
+            return result
+    
+    # Skip complex RL if no piece count available
+    result.skip_reason = SkipReason.RL_COMPLEX
+    result.diagnostics.append("Skipped: RL without clear piece count")
+    return result
+
+def process_fixed_length_item(
     row: pd.Series,
     raw: RawExtraction,
     cfg: ExtractConfig
 ) -> ProcessedResult:
-    """Stage 2: Apply business rules to determine official values"""
+    """Process fixed-length items with dedicated logic"""
     result = ProcessedResult()
     result.diagnostics = raw.diagnostics.copy()
     
     code = str(row.get(cfg.col_item_code, "") or "")
-    desc = str(row.get(cfg.col_desc, "") or "")
     orig_qty = row.get(cfg.col_orig_qty, None)
-    orig_uom = row.get(cfg.col_orig_uom, None)
+    orig_uom = str(row.get(cfg.col_orig_uom, "") or "").strip().upper()
     
-    # Check if non-screw item
-    if is_non_screw_item(desc):
-        result.skip_reason = SkipReason.NON_SCREW_ITEM
-        result.diagnostics.append("Skipped: Non-screw item")
-        return result
-    
-    # Priority 1: Cut plans override everything
+    # Priority 1: Cut plans override everything for fixed-length items
     if raw.cut_plans:
         total_pcs = sum(c for c, _ in raw.cut_plans)
         total_inches = sum(c * l for c, l in raw.cut_plans)
@@ -428,51 +559,122 @@ def stage2_apply_rules(
             result.confidence = "high"
             result.rationale = f"{len(raw.cut_plans)} cut group(s), weighted avg"
             result.diagnostics.append(f"Cut plan result: {total_pcs} pcs @ {result.official_length}\"")
+            
+            # Flag complex cuts
+            if len(raw.cut_plans) > 1:
+                result.flags.append("complex_cut")
             return result
     
-    # Priority 2: RL handling
-    if raw.is_rl:
-        uom = str(orig_uom).strip().upper() if orig_uom else ""
-        
-        if uom in FEETLIKE_UOMS and orig_qty:
-            total_feet = _to_float_safe(orig_qty)
-            
-            # If we have piece count from notes, use it
-            if raw.rl_piece_count and raw.rl_piece_count > 0:
-                length_inches = (total_feet * 12.0) / raw.rl_piece_count
-                result.official_length = round(length_inches, 0)  # Round to nearest inch for RL
-                result.official_qty = raw.rl_piece_count
-                result.source = "rl_with_count"
-                result.confidence = "high"
-                result.rationale = f"RL: {total_feet}ft / {raw.rl_piece_count} pcs"
-                return result
-            else:
-                # Skip complex RL without clear piece count
-                result.skip_reason = SkipReason.RL_COMPLEX
-                result.diagnostics.append("Skipped: RL without clear piece count")
-                return result
-    
-    # Priority 3: Code suffix (if not -L)
+    # Priority 2: Code suffix (if not -L)
     code_is_L = bool(RE_CODE_SUFFIX_L.search(code))
     if not code_is_L and raw.code_suffix_length:
         result.official_length = round(raw.code_suffix_length, 2)
         result.source = "item_code_suffix"
         result.confidence = "high"
-    # Priority 4: Description length
+        
+        # Flag suspect code lengths
+        if raw.code_suffix_length > 100:
+            result.flags.append("suspect_code_length")
+    # Priority 3: Description length
     elif raw.desc_length:
         result.official_length = round(raw.desc_length, 2)
         result.source = "description"
         result.confidence = "medium"
-    # Priority 5: Notes length
+    # Priority 4: Notes length
     elif raw.notes_length:
         result.official_length = round(raw.notes_length, 2)
         result.source = "notes"
         result.confidence = "low"
-    # Priority 6: Parentheses (lowest priority)
+    # Priority 5: Parentheses (lowest priority)
     elif raw.parentheses_length:
         result.official_length = round(raw.parentheses_length, 2)
         result.source = "parentheses"
         result.confidence = "low"
+    
+    # Determine quantity for fixed-length items
+    if result.official_length and result.official_qty is None:
+        if orig_uom in EACHLIKE_UOMS:
+            # For each-like units, use original quantity
+            oq = _to_float_safe(orig_qty)
+            if oq is not None:
+                result.official_qty = int(round(oq))
+                result.diagnostics.append(f"Qty from original (EA): {result.official_qty}")
+        elif orig_uom in FEETLIKE_UOMS and orig_qty:
+            # For feet, calculate pieces with smart rounding
+            total_feet = _to_float_safe(orig_qty)
+            if total_feet and result.official_length:
+                exact_qty = (total_feet * 12.0) / result.official_length
+                
+                # Try different rounding strategies
+                qty_round = int(round(exact_qty))
+                qty_floor = int(exact_qty) if exact_qty > 0 else 0
+                qty_ceil = int(exact_qty) + 1 if exact_qty > int(exact_qty) else int(exact_qty)
+                
+                # Calculate errors for each strategy
+                candidates = []
+                for qty_candidate in [qty_floor, qty_round, qty_ceil]:
+                    if qty_candidate > 0:
+                        recon_feet = (qty_candidate * result.official_length) / 12.0
+                        error = abs(recon_feet - total_feet) / max(total_feet, 0.001)
+                        candidates.append((qty_candidate, error, recon_feet))
+                
+                # Choose the quantity with smallest error
+                if candidates:
+                    best_qty, best_error, best_recon = min(candidates, key=lambda x: x[1])
+                    result.official_qty = best_qty
+                    
+                    # Check if adjustment was made
+                    if best_qty != qty_round:
+                        result.diagnostics.append(f"Qty adjusted to {best_qty} (from rounded {qty_round}) to fit total length better")
+                    else:
+                        result.diagnostics.append(f"Qty from feet calc: {result.official_qty}")
+                    
+                    # Flag if tolerance exceeded
+                    if best_error > cfg.ft_tolerance_pct:
+                        result.flags.append(f"feet_tolerance_{best_error:.1%}")
+                else:
+                    # Fallback to simple rounding
+                    result.official_qty = int(round(exact_qty))
+                    result.diagnostics.append(f"Qty from feet calc (fallback): {result.official_qty}")
+    
+    return result
+
+def stage2_apply_rules(
+    row: pd.Series,
+    raw: RawExtraction,
+    cfg: ExtractConfig
+) -> ProcessedResult:
+    """Stage 2: Apply business rules with modular RL vs fixed-length processing"""
+    desc = str(row.get(cfg.col_desc, "") or "")
+    notes = str(row.get(cfg.col_notes, "") or "")
+    
+    # Check if non-screw item first
+    if is_non_screw_item(desc):
+        result = ProcessedResult()
+        result.diagnostics = raw.diagnostics.copy()
+        result.skip_reason = SkipReason.NON_SCREW_ITEM
+        result.diagnostics.append("Skipped: Non-screw item")
+        return result
+    
+    # Branch into RL vs fixed-length processing
+    if raw.is_rl:
+        # Process RL items with specialized logic
+        result = process_rl_item(row, raw, cfg)
+    else:
+        # Process fixed-length items with specialized logic
+        result = process_fixed_length_item(row, raw, cfg)
+    
+    # Common post-processing for both paths
+    
+    # Sanity check: prefer parenthetical values over unreasonable lengths
+    if (result.official_length and result.official_length > cfg.max_inch and 
+        raw.parentheses_length and raw.parentheses_length <= cfg.max_inch):
+        old_length = result.official_length
+        result.official_length = round(raw.parentheses_length, 2)
+        result.source = "parentheses_override"
+        result.confidence = "medium"
+        result.diagnostics.append(f"Used {result.official_length}\" from parentheses instead of {old_length}\"")
+        result.flags.append("parentheses_override")
     
     # Validate length
     if result.official_length:
@@ -485,29 +687,31 @@ def stage2_apply_rules(
             result.official_length = None
             result.flags.append("non_positive_length")
     
-    # Determine quantity if not already set
-    if result.official_length and result.official_qty is None:
-        uom = str(orig_uom).strip().upper() if orig_uom else ""
+    # Handle ambiguous cut instructions as fallback
+    if result.official_length is None and detect_ambiguous_cuts(notes):
+        # Try to use full bar length for ambiguous cuts
+        fallback_length = None
         
-        if uom in EACHLIKE_UOMS:
-            # For each-like units, use original quantity
-            oq = _to_float_safe(orig_qty)
-            if oq is not None:
-                result.official_qty = int(round(oq))
-                result.diagnostics.append(f"Qty from original (EA): {result.official_qty}")
-        elif uom in FEETLIKE_UOMS and orig_qty:
-            # For feet, calculate pieces
-            total_feet = _to_float_safe(orig_qty)
-            if total_feet and result.official_length:
-                est_qty = (total_feet * 12.0) / result.official_length
-                result.official_qty = int(round(est_qty))
-                
-                # Check tolerance
-                recon_feet = (result.official_qty * result.official_length) / 12.0
-                err = abs(recon_feet - total_feet) / max(total_feet, 0.001)
-                if err > cfg.ft_tolerance_pct:
-                    result.flags.append(f"feet_tolerance_{err:.1%}")
-                result.diagnostics.append(f"Qty from feet calc: {result.official_qty}")
+        if raw.is_rl and raw.rl_bar_feet:
+            # For RL items, use bar length
+            fallback_length = raw.rl_bar_feet * 12.0
+            result.diagnostics.append(f"Used RL bar length for ambiguous cut: {raw.rl_bar_feet}ft = {fallback_length}\"")
+        elif raw.code_suffix_length:
+            # Try to use item code length
+            fallback_length = raw.code_suffix_length
+            result.diagnostics.append(f"Used item code length for ambiguous cut: {fallback_length}\"")
+        elif raw.desc_length:
+            # Try to use description length
+            fallback_length = raw.desc_length
+            result.diagnostics.append(f"Used description length for ambiguous cut: {fallback_length}\"")
+        
+        if fallback_length:
+            result.official_length = round(fallback_length, 2)
+            result.official_qty = 1  # Assume 1 piece for ambiguous cuts
+            result.source = "ambiguous_cut_fallback"
+            result.confidence = "low"
+            result.flags.append("ambiguous_cut")
+            result.rationale = "Ambiguous cut instruction - outputting full length"
     
     # Final validation
     if result.official_length is None:
