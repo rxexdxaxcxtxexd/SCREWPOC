@@ -45,8 +45,15 @@ NON_SCREW_KEYWORDS = [
     "O-RING", "SPRING", "PIN", "KEY", "SHIM", "SPACER", "PLATE"
 ]
 
-# Valid screw-related keywords
-SCREW_KEYWORDS = ["SCREW", "WORM", "KNURL", "ACME", "THREAD", "STUB"]
+# Valid screw-related keywords - expanded
+SCREW_KEYWORDS = ["SCREW", "WORM", "KNURL", "ACME", "THREAD", "STUB", "BOLT", "STUD", "FASTENER", "RIVET", "DOWEL", "ROD"]
+
+# Contextual screw phrases that should override non-screw classification
+CONTEXTUAL_SCREW_PHRASES = [
+    "MOUNT SCREW", "MOUNTING SCREW", "BRACKET SCREW", "ADAPTER SCREW",
+    "COUPLING SCREW", "FLANGE SCREW", "THREADED ROD", "THREADED STUD",
+    "SHOULDER SCREW", "MACHINE SCREW", "HEX BOLT", "CAP SCREW"
+]
 
 class SkipReason(Enum):
     """Reasons for skipping a record"""
@@ -65,6 +72,8 @@ class ExtractConfig:
     round_length_ndp: int = 2       # round to 2 decimals
     use_round_for_ft_qty: bool = True
     enable_diagnostics: bool = True
+    debug_mode: bool = False        # Enable comprehensive diagnostic logging
+    rl_fallback_enabled: bool = False  # Enable RL fallback for zero-info cases
     # Column names
     col_item_code: str = "ITEM CODE"
     col_desc: str = "ITEM DESCRIPTION"
@@ -99,6 +108,13 @@ RE_MM_ONLY = re.compile(
     r"(?P<mm>\d+(?:\.\d+)?)\s*MM\b",
     re.IGNORECASE,
 )
+RE_CM_ONLY = re.compile(
+    r"(?P<cm>\d+(?:\.\d+)?)\s*CM\b",
+    re.IGNORECASE,
+)
+
+# Metric thread pattern for implicit metric detection
+RE_METRIC_THREAD = re.compile(r"M\d+", re.IGNORECASE)
 
 # X-by pattern
 RE_X_BY = re.compile(r"\b(?:x|×|by)\b", re.IGNORECASE)
@@ -113,15 +129,25 @@ CUT_PATTERNS = [
     re.compile(r"(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?|PC\.?)\s*(?:TO|@)\s*(?P<len>[\d\s\-/\"'\.]+?)(?:\s*(?:OAL|LENGTH|LENGTHS)(?:\s+EACH)?|\s*EACH)?", re.IGNORECASE),
     # "X PIECES OF Y LENGTH"
     re.compile(r"(?P<count>\d+)\s*(?:PCS?\.?|PIECES?\.?)\s*(?:OF|AT)\s*(?P<len>[\d\s\-/\"'\.]+?)\s*(?:LENGTH|LONG)?", re.IGNORECASE),
+    # NEW: Standalone piece declarations like "1 PC 3'" or "2 PCS 24""
+    re.compile(r"(?P<count>\d+)\s*(?:PC\.?|PCS?\.?|PIECES?\.?)\s+(?P<len>[\d\s\-/\"'\.]+?)(?:\s|$|;|AND|&)", re.IGNORECASE),
+    # NEW: Piece declarations with "of" like "2 pieces of 6'"
+    re.compile(r"(?P<count>\d+)\s*(?:PIECE?S?)\s*OF\s*(?P<len>[\d\s\-/\"'\.]+?)(?:\s|$|;|AND|&)", re.IGNORECASE),
+    # NEW: Length-first format like "6' x 2 pieces" or "24\" - 3 pcs"
+    re.compile(r"(?P<len>[\d\s\-/\"'\.]+?)\s*[-x×]\s*(?P<count>\d+)\s*(?:PC\.?|PCS?\.?|PIECES?\.?)", re.IGNORECASE),
+    # NEW: Quantity-length pairs like "QTY 2 @ 12'" or "2 EA @ 6'"
+    re.compile(r"(?:QTY\s*)?(?P<count>\d+)\s*(?:EA\.?|EACH)?\s*@\s*(?P<len>[\d\s\-/\"'\.]+?)", re.IGNORECASE),
 ]
 
-# Ambiguous cut instruction patterns
+# Ambiguous cut instruction patterns with piece count inference
 AMBIGUOUS_CUT_PATTERNS = [
-    re.compile(r"CUT\s+(?:BARS?\s+)?IN\s+HALF", re.IGNORECASE),
-    re.compile(r"CUT\s+(?:INTO\s+)?(?:THIRDS?|1/3)", re.IGNORECASE), 
-    re.compile(r"CUT\s+(?:INTO\s+)?(?:QUARTERS?|1/4)", re.IGNORECASE),
-    re.compile(r"CUT\s+(?:BARS?\s+)?AS\s+NEEDED", re.IGNORECASE),
-    re.compile(r"CUT\s+(?:BARS?\s+)?IF\s+NECESSARY", re.IGNORECASE),
+    # Pattern with piece count inference: (regex, piece_count, description)
+    (re.compile(r"CUT\s+(?:BARS?\s+)?IN\s+HALF", re.IGNORECASE), 2, "cut in half"),
+    (re.compile(r"CUT\s+(?:INTO\s+)?(?:THIRDS?|1/3)", re.IGNORECASE), 3, "cut into thirds"),
+    (re.compile(r"CUT\s+(?:INTO\s+)?(?:QUARTERS?|1/4)", re.IGNORECASE), 4, "cut into quarters"), 
+    (re.compile(r"CUT\s+INTO\s+(\d+)\s*(?:PIECES?|PCS?)", re.IGNORECASE), None, "cut into N pieces"),  # Special case
+    (re.compile(r"CUT\s+(?:BARS?\s+)?AS\s+NEEDED", re.IGNORECASE), 1, "cut as needed"),
+    (re.compile(r"CUT\s+(?:BARS?\s+)?IF\s+NECESSARY", re.IGNORECASE), 1, "cut if necessary"),
 ]
 
 # RL patterns
@@ -198,8 +224,26 @@ def _parse_fractional_number(token: str) -> Optional[float]:
     
     return None
 
-def parse_len_token_to_inches(token: str) -> Optional[float]:
-    """Convert a length token to inches"""
+def detect_implicit_metric(text: str, bare_number: float) -> Optional[float]:
+    """Detect if a bare number is likely metric based on context"""
+    if not text or bare_number <= 100:
+        return None
+    
+    text_upper = text.upper()
+    
+    # If text contains metric thread designation and number is large, likely mm
+    if RE_METRIC_THREAD.search(text_upper) and bare_number > 100:
+        return bare_number / 25.4  # Convert mm to inches
+    
+    # If description mentions metric terms and number is very large, likely mm
+    metric_indicators = ["METRIC", "ISO", "DIN", "M10", "M12", "M16", "M20"]
+    if any(indicator in text_upper for indicator in metric_indicators) and bare_number > 300:
+        return bare_number / 25.4
+    
+    return None
+
+def parse_len_token_to_inches(token: str, context_text: str = "") -> Optional[float]:
+    """Convert a length token to inches with enhanced metric support"""
     if token is None:
         return None
     s = token.strip()
@@ -219,12 +263,26 @@ def parse_len_token_to_inches(token: str) -> Optional[float]:
     if m:
         return _parse_fractional_number(m.group("in"))
     
+    # CM (centimeters)
+    m = RE_CM_ONLY.search(s)
+    if m:
+        cm = _to_float_safe(m.group("cm"))
+        if cm is not None:
+            return (cm * 10) / 25.4  # Convert cm to mm, then to inches
+    
     # MM only
     m = RE_MM_ONLY.search(s)
     if m:
         mm = _to_float_safe(m.group("mm"))
         if mm is not None:
             return mm / 25.4
+    
+    # Try implicit metric detection for bare numbers
+    bare_num = _to_float_safe(s)
+    if bare_num is not None and context_text:
+        implicit_inches = detect_implicit_metric(context_text, bare_num)
+        if implicit_inches is not None:
+            return implicit_inches
     
     return None
 
@@ -255,7 +313,7 @@ def extract_len_from_xby(text: str) -> Optional[float]:
     if len(parts) < 2:
         return None
     tail = parts[-1]
-    return parse_len_token_to_inches(tail)
+    return parse_len_token_to_inches(tail, text)
 
 def find_all_cut_plans(text: str, diagnostics: List[str]) -> List[Tuple[int, float]]:
     """Find all cut instructions in text using flexible patterns with multi-segment support"""
@@ -286,7 +344,7 @@ def find_all_cut_plans(text: str, diagnostics: List[str]) -> List[Tuple[int, flo
                 try:
                     cnt = int(m.group("count"))
                     len_str = m.group("len")
-                    inches = parse_len_token_to_inches(len_str)
+                    inches = parse_len_token_to_inches(len_str, segment)
                     if inches is not None and inches > 0:
                         segment_matches.append((cnt, inches))
                         diagnostics.append(f"Cut pattern {pattern_idx+1} matched in segment {seg_idx+1}: {cnt} pcs @ {inches:.2f}\"")
@@ -301,7 +359,7 @@ def find_all_cut_plans(text: str, diagnostics: List[str]) -> List[Tuple[int, flo
         for drop_match in drop_pattern.finditer(segment):
             try:
                 len_str = drop_match.group("len")
-                inches = parse_len_token_to_inches(len_str)
+                inches = parse_len_token_to_inches(len_str, segment)
                 if inches is not None and inches > 0:
                     out.append((1, inches))  # Assume 1 piece for drop
                     diagnostics.append(f"Found drop piece in segment {seg_idx+1}: 1 pc @ {inches:.2f}\"")
@@ -327,24 +385,61 @@ def detect_ambiguous_cuts(text: str) -> bool:
     if not text:
         return False
     
-    for pattern in AMBIGUOUS_CUT_PATTERNS:
+    for pattern_tuple in AMBIGUOUS_CUT_PATTERNS:
+        pattern = pattern_tuple[0]  # Extract regex from tuple
         if pattern.search(text):
             return True
     return False
 
+def calculate_ambiguous_cut_breakdown(text: str, source_length: float) -> Optional[Tuple[int, float, str]]:
+    """Calculate piece breakdown for ambiguous cut instructions
+    Returns: (piece_count, length_per_piece, reasoning) or None"""
+    if not text or not source_length:
+        return None
+    
+    for pattern_tuple in AMBIGUOUS_CUT_PATTERNS:
+        pattern, default_count, description = pattern_tuple
+        match = pattern.search(text)
+        if match:
+            # Special handling for "CUT INTO N PIECES" pattern
+            if description == "cut into N pieces":
+                try:
+                    piece_count = int(match.group(1))  # Extract N from the match
+                    length_per_piece = source_length / piece_count
+                    reasoning = f"calculated {piece_count} pieces from '{description}'"
+                    return (piece_count, length_per_piece, reasoning)
+                except (ValueError, IndexError):
+                    continue
+            elif default_count and default_count > 1:
+                # Calculate breakdown for fixed piece counts
+                length_per_piece = source_length / default_count
+                reasoning = f"calculated {default_count} pieces from '{description}'"
+                return (default_count, length_per_piece, reasoning)
+            else:
+                # For "as needed" or "if necessary", return single piece
+                reasoning = f"ambiguous instruction '{description}' - using full length"
+                return (1, source_length, reasoning)
+    
+    return None
+
 def is_non_screw_item(desc: str) -> bool:
-    """Check if item is not a screw based on description"""
+    """Check if item is not a screw based on description - enhanced with contextual logic"""
     if not desc:
         return False
     
     desc_upper = desc.upper()
     
-    # First check if it contains valid screw keywords
+    # First check for contextual screw phrases (highest priority)
+    for phrase in CONTEXTUAL_SCREW_PHRASES:
+        if phrase in desc_upper:
+            return False  # Definitely a screw item
+    
+    # Check if it contains valid screw keywords
     has_screw_keyword = any(keyword in desc_upper for keyword in SCREW_KEYWORDS)
     if has_screw_keyword:
-        return False
+        return False  # Likely a screw item
     
-    # Then check for non-screw keywords
+    # Check for non-screw keywords only if no screw indicators found
     has_non_screw = any(keyword in desc_upper for keyword in NON_SCREW_KEYWORDS)
     return has_non_screw
 
@@ -390,6 +485,47 @@ def parse_item_code_suffix_inches(code: str, diagnostics: List[str] = None) -> O
     
     return None
 
+def validate_cross_sources(raw: RawExtraction) -> Tuple[bool, str]:
+    """Check if multiple sources agree on length and return verification info"""
+    sources = []
+    
+    if raw.code_suffix_length:
+        sources.append(("code", raw.code_suffix_length))
+    if raw.desc_length:
+        sources.append(("description", raw.desc_length))
+    if raw.notes_length:
+        sources.append(("notes", raw.notes_length))
+    
+    if len(sources) < 2:
+        return False, ""
+    
+    # Check if any two sources agree within 5%
+    for i, (name1, len1) in enumerate(sources):
+        for name2, len2 in sources[i+1:]:
+            if abs(len1 - len2) / max(len1, len2, 0.001) <= 0.05:  # Within 5%
+                return True, f"{name1} and {name2} agree ({len1:.2f}\" ≈ {len2:.2f}\")"
+    
+    return False, ""
+
+def detect_explicit_units_in_notes(notes: str) -> bool:
+    """Detect explicit length specifications in notes like 'Length: 24 inches'"""
+    if not notes:
+        return False
+    
+    explicit_patterns = [
+        r"LENGTH:\s*\d+(?:\.\d+)?\s*(?:INCHES?|IN|\")",
+        r"OVERALL\s+LENGTH:\s*\d+(?:\.\d+)?\s*(?:INCHES?|IN|\")",
+        r"DIMENSION:\s*\d+(?:\.\d+)?\s*(?:INCHES?|IN|\")",
+        r"SIZE:\s*\d+(?:\.\d+)?\s*(?:INCHES?|IN|\")"
+    ]
+    
+    notes_upper = notes.upper()
+    for pattern in explicit_patterns:
+        if re.search(pattern, notes_upper):
+            return True
+    
+    return False
+
 # ---------------------------
 # Stage 1: Raw Extraction
 # ---------------------------
@@ -420,14 +556,14 @@ def stage1_extract_raw(row: pd.Series, cfg: ExtractConfig) -> RawExtraction:
         result.desc_length = desc_xby
         result.diagnostics.append(f"Description x-by: {desc_xby}\"")
     else:
-        # Try general parsing
-        desc_general = parse_len_token_to_inches(desc)
+        # Try general parsing with context
+        desc_general = parse_len_token_to_inches(desc, desc)
         if desc_general:
             result.desc_length = desc_general
             result.diagnostics.append(f"Description general: {desc_general}\"")
     
-    # 4. Extract from notes (general)
-    notes_len = parse_len_token_to_inches(notes)
+    # 4. Extract from notes (general) with context
+    notes_len = parse_len_token_to_inches(notes, notes)
     if notes_len:
         result.notes_length = notes_len
         result.diagnostics.append(f"Notes general: {notes_len}\"")
@@ -527,7 +663,20 @@ def process_rl_item(
             result.flags.append("rl_note_inferred")
             return result
     
-    # Skip complex RL if no piece count available
+    # Optional RL fallback for zero-info cases
+    if cfg.rl_fallback_enabled:
+        # Use full RL bar length as fallback
+        fallback_length = raw.rl_bar_feet * 12.0 if raw.rl_bar_feet else 144.0  # Default 12ft
+        result.official_length = round(fallback_length, 0)
+        result.official_qty = 1
+        result.source = "rl_fallback"
+        result.confidence = "low"
+        result.flags.append("assumed_full_length")
+        result.rationale = f"RL fallback: assumed 1 piece @ full bar length"
+        result.diagnostics.append(f"RL fallback applied: 1 pc @ {result.official_length}\" (full bar)")
+        return result
+    
+    # Skip complex RL if no piece count available and fallback disabled
     result.skip_reason = SkipReason.RL_COMPLEX
     result.diagnostics.append("Skipped: RL without clear piece count")
     return result
@@ -542,6 +691,7 @@ def process_fixed_length_item(
     result.diagnostics = raw.diagnostics.copy()
     
     code = str(row.get(cfg.col_item_code, "") or "")
+    notes = str(row.get(cfg.col_notes, "") or "")
     orig_qty = row.get(cfg.col_orig_qty, None)
     orig_uom = str(row.get(cfg.col_orig_uom, "") or "").strip().upper()
     
@@ -565,8 +715,10 @@ def process_fixed_length_item(
                 result.flags.append("complex_cut")
             return result
     
-    # Priority 2: Code suffix (if not -L)
+    # Determine primary source and initial confidence
     code_is_L = bool(RE_CODE_SUFFIX_L.search(code))
+    
+    # Priority 2: Code suffix (if not -L)
     if not code_is_L and raw.code_suffix_length:
         result.official_length = round(raw.code_suffix_length, 2)
         result.source = "item_code_suffix"
@@ -585,11 +737,28 @@ def process_fixed_length_item(
         result.official_length = round(raw.notes_length, 2)
         result.source = "notes"
         result.confidence = "low"
+        
+        # Upgrade confidence if explicit units detected
+        if detect_explicit_units_in_notes(notes):
+            result.confidence = "medium"
+            result.flags.append("explicit_units_in_notes")
+            result.diagnostics.append("Upgraded confidence: explicit units found in notes")
     # Priority 5: Parentheses (lowest priority)
     elif raw.parentheses_length:
         result.official_length = round(raw.parentheses_length, 2)
         result.source = "parentheses"
         result.confidence = "low"
+    
+    # Apply cross-verification confidence boost
+    if result.official_length:
+        cross_verified, verification_msg = validate_cross_sources(raw)
+        if cross_verified:
+            if result.confidence == "medium":
+                result.confidence = "high"
+            elif result.confidence == "low":
+                result.confidence = "medium"
+            result.flags.append("cross_verified")
+            result.diagnostics.append(f"Confidence boosted: {verification_msg}")
     
     # Determine quantity for fixed-length items
     if result.official_length and result.official_qty is None:
@@ -687,34 +856,49 @@ def stage2_apply_rules(
             result.official_length = None
             result.flags.append("non_positive_length")
     
-    # Handle ambiguous cut instructions as fallback
+    # Handle ambiguous cut instructions with intelligent interpretation
     if result.official_length is None and detect_ambiguous_cuts(notes):
-        # Try to use full bar length for ambiguous cuts
-        fallback_length = None
+        # Determine source length for calculation
+        source_length = None
+        source_desc = ""
         
         if raw.is_rl and raw.rl_bar_feet:
-            # For RL items, use bar length
-            fallback_length = raw.rl_bar_feet * 12.0
-            result.diagnostics.append(f"Used RL bar length for ambiguous cut: {raw.rl_bar_feet}ft = {fallback_length}\"")
+            source_length = raw.rl_bar_feet * 12.0
+            source_desc = f"RL bar ({raw.rl_bar_feet}ft)"
         elif raw.code_suffix_length:
-            # Try to use item code length
-            fallback_length = raw.code_suffix_length
-            result.diagnostics.append(f"Used item code length for ambiguous cut: {fallback_length}\"")
+            source_length = raw.code_suffix_length
+            source_desc = "item code"
         elif raw.desc_length:
-            # Try to use description length
-            fallback_length = raw.desc_length
-            result.diagnostics.append(f"Used description length for ambiguous cut: {fallback_length}\"")
+            source_length = raw.desc_length
+            source_desc = "description"
+        elif raw.parentheses_length:
+            source_length = raw.parentheses_length
+            source_desc = "parentheses"
         
-        if fallback_length:
-            result.official_length = round(fallback_length, 2)
-            result.official_qty = 1  # Assume 1 piece for ambiguous cuts
-            result.source = "ambiguous_cut_fallback"
-            result.confidence = "low"
-            result.flags.append("ambiguous_cut")
-            result.rationale = "Ambiguous cut instruction - outputting full length"
+        if source_length:
+            # Try intelligent calculation first
+            breakdown = calculate_ambiguous_cut_breakdown(notes, source_length)
+            if breakdown:
+                piece_count, length_per_piece, reasoning = breakdown
+                result.official_length = round(length_per_piece, 2)
+                result.official_qty = piece_count
+                result.source = "ambiguous_cut_calculated"
+                result.confidence = "low"
+                result.flags.append("ambiguous_cut_calculated")
+                result.rationale = f"Ambiguous cut: {reasoning} from {source_desc}"
+                result.diagnostics.append(f"Calculated ambiguous cut: {piece_count} pcs @ {result.official_length}\" ({reasoning})")
+            else:
+                # Fallback to original single-piece logic
+                result.official_length = round(source_length, 2)
+                result.official_qty = 1
+                result.source = "ambiguous_cut_fallback"
+                result.confidence = "low"
+                result.flags.append("ambiguous_cut")
+                result.rationale = f"Ambiguous cut instruction - using full length from {source_desc}"
+                result.diagnostics.append(f"Ambiguous cut fallback: 1 pc @ {result.official_length}\" from {source_desc}")
     
-    # Final validation
-    if result.official_length is None:
+    # Final validation - preserve specific skip reasons
+    if result.official_length is None and result.skip_reason is None:
         result.skip_reason = SkipReason.NO_LENGTH_AVAILABLE
         result.flags.append("no_length_found")
     
@@ -875,11 +1059,15 @@ def process_workbook(
 # ---------------------------
 
 if __name__ == "__main__":
-    input_file = r"C:\Users\layden\source_data.xlsx"
-    output_file = r"C:\Users\layden\processed_screw_data.xlsx"
+    input_file = r"C:\Users\layden\SCREWPOC\source_data.xlsx"
+    output_file = r"C:\Users\layden\OneDrive - Cornerstone Solutions Group\Desktop\AI Projects\Roton\Test #4\Enhanced_Screw_Extraction_Results.xlsx"
     
-    # Create config with working columns enabled
-    cfg = ExtractConfig(max_inch=300.0)
+    # Create config with enhanced features enabled
+    cfg = ExtractConfig(
+        max_inch=300.0,
+        debug_mode=True,
+        rl_fallback_enabled=True  # Enable RL fallback to minimize skips
+    )
     
     try:
         print(f"Processing {input_file}...")
